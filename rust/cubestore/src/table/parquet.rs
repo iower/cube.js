@@ -103,6 +103,7 @@ mod tests {
                     ),
                 ],
                 3,
+                None,
             )
             .unwrap(),
             row_group_size: 10,
@@ -211,6 +212,7 @@ mod tests {
                 0,
                 vec![Column::new("b".to_string(), ColumnType::Boolean, 0)],
                 1,
+                None,
             )
             .unwrap();
             let tmp_file = NamedTempFile::new().unwrap();
@@ -256,6 +258,7 @@ mod tests {
                 Column::new("bytes".into(), ColumnType::Bytes, 1),
             ],
             1,
+            None,
         )
         .unwrap();
 

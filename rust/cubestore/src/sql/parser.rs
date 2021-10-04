@@ -1,4 +1,4 @@
-use sqlparser::ast::{HiveDistributionStyle, ObjectName, Query, Statement as SQLStatement};
+use sqlparser::ast::{HiveDistributionStyle, Ident, ObjectName, Query, Statement as SQLStatement};
 use sqlparser::dialect::keywords::Keyword;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -26,10 +26,17 @@ impl Dialect for MySqlDialectWithBackTicks {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PartitionedIndexRef {
+    pub name: ObjectName,
+    pub columns: Vec<Ident>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Statement(SQLStatement),
     CreateTable {
         create_table: SQLStatement,
+        partitioned_index: Option<PartitionedIndexRef>,
         indexes: Vec<SQLStatement>,
         locations: Option<Vec<String>>,
     },
@@ -114,6 +121,23 @@ impl<'a> CubeStoreParser<'a> {
                 indexes.push(self.parse_with_index(name.clone())?);
             }
 
+            let partitioned_index = if self.parser.parse_keywords(&[
+                Keyword::ADD,
+                Keyword::TO,
+                Keyword::PARTITIONED,
+                Keyword::INDEX,
+            ]) {
+                let name = self.parser.parse_object_name()?;
+                self.parser.expect_token(&Token::LParen)?;
+                let columns = self
+                    .parser
+                    .parse_comma_separated(Parser::parse_identifier)?;
+                self.parser.expect_token(&Token::RParen)?;
+                Some(PartitionedIndexRef { name, columns })
+            } else {
+                None
+            };
+
             let locations = if self.parser.parse_keyword(Keyword::LOCATION) {
                 Some(
                     self.parser
@@ -143,6 +167,7 @@ impl<'a> CubeStoreParser<'a> {
                     like,
                 },
                 indexes,
+                partitioned_index,
                 locations,
             })
         } else {

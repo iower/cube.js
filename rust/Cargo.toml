@@ -7,3 +7,6 @@ members = [
     "cubezetasketch",
     "cuberpc",
 ]
+
+[patch."https://github.com/cube-js/sqlparser-rs.git"]
+sqlparser = { git = "https://github.com/cube-js//sqlparser-rs.git", branch = "part-ind" }

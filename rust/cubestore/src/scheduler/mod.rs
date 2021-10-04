@@ -120,6 +120,14 @@ impl SchedulerImpl {
                 }
             }
         }
+        if let MetaStoreEvent::Insert(TableId::MultiPartitions, id)
+        | MetaStoreEvent::Update(TableId::MultiPartitions, id) = event
+        {
+            let p = self.meta_store.get_multi_partition(id).await?;
+            if 2 * self.config.partition_split_threshold() < p.get_row().total_row_count() {
+                self.schedule_multi_partition_split(id).await?;
+            }
+        }
         if let MetaStoreEvent::Insert(TableId::Chunks, row_id)
         | MetaStoreEvent::Update(TableId::Chunks, row_id) = event
         {
@@ -132,7 +140,7 @@ impl SchedulerImpl {
                 if chunk.get_row().active() {
                     if partition.get_row().is_active() {
                         // TODO config
-                        let chunk_sizes = self
+                        let chunk_rows = self
                             .meta_store
                             .get_partition_chunk_sizes(chunk.get_row().get_partition_id())
                             .await?;
@@ -140,7 +148,9 @@ impl SchedulerImpl {
                             .meta_store
                             .get_chunks_by_partition(chunk.get_row().get_partition_id(), false)
                             .await?;
-                        if chunk_sizes > self.config.compaction_chunks_total_size_threshold()
+                        let check_row_counts = partition.get_row().multi_partition_id().is_none();
+                        if check_row_counts
+                            && chunk_rows > self.config.compaction_chunks_total_size_threshold()
                             || chunks.len()
                                 > self.config.compaction_chunks_count_threshold() as usize
                         {
@@ -188,7 +198,7 @@ impl SchedulerImpl {
         if let MetaStoreEvent::Update(TableId::Partitions, row_id) = event {
             let partition = self.meta_store.get_partition(row_id).await?;
             if !partition.get_row().is_active() {
-                self.schedule_repartition(row_id).await?;
+                self.schedule_repartition_if_needed(row_id).await?;
                 if partition.get_row().main_table_row_count() > 0 {
                     if let Some(file_name) = partition.get_row().get_full_name(partition.get_id()) {
                         let deadline =
@@ -204,14 +214,7 @@ impl SchedulerImpl {
                 if let RowKey::Table(TableId::Partitions, partition_id) =
                     job.get_row().row_reference()
                 {
-                    if self
-                        .meta_store
-                        .get_partition_chunk_sizes(*partition_id)
-                        .await?
-                        > 0
-                    {
-                        self.schedule_repartition(*partition_id).await?;
-                    }
+                    self.schedule_repartition_if_needed(*partition_id).await?;
                 } else {
                     panic!(
                         "Unexpected row reference: {:?}",
@@ -219,6 +222,17 @@ impl SchedulerImpl {
                     );
                 }
             }
+        }
+        Ok(())
+    }
+
+    async fn schedule_repartition_if_needed(&self, partition_id: u64) -> Result<(), CubeError> {
+        let chunk_rows = self
+            .meta_store
+            .get_partition_chunk_sizes(partition_id)
+            .await?;
+        if 0 < chunk_rows {
+            self.schedule_repartition(partition_id).await?;
         }
         Ok(())
     }
@@ -276,6 +290,26 @@ impl SchedulerImpl {
         if job.is_some() {
             // TODO queue failover
             self.cluster.notify_job_runner(wal_node_name).await?;
+        }
+        Ok(())
+    }
+
+    async fn schedule_multi_partition_split(
+        &self,
+        multi_partition_id: u64,
+    ) -> Result<(), CubeError> {
+        let node = self.cluster.node_name_by_partitions(&[multi_partition_id]);
+        let job = self
+            .meta_store
+            .add_job(Job::new(
+                RowKey::Table(TableId::MultiPartitions, multi_partition_id),
+                JobType::MultiPartitionSplit,
+                node.clone(),
+            ))
+            .await?;
+        if job.is_some() {
+            // TODO queue failover
+            self.cluster.notify_job_runner(node).await?;
         }
         Ok(())
     }

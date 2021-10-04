@@ -590,6 +590,16 @@ impl JobRunner {
                     Self::fail_job_row_key(job);
                 }
             }
+            JobType::MultiPartitionSplit => {
+                if let RowKey::Table(TableId::MultiPartitions, id) = job.row_reference() {
+                    self.compaction_service
+                        .clone()
+                        .split_multi_partition(*id)
+                        .await?
+                } else {
+                    Self::fail_job_row_key(job);
+                }
+            }
             JobType::TableImport => {
                 if let RowKey::Table(TableId::Tables, table_id) = job.row_reference() {
                     let import_service = self.import_service.clone();

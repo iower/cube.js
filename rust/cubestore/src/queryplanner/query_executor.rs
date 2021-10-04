@@ -582,15 +582,36 @@ impl ClusterSendExec {
     }
 
     pub fn logical_partitions(snapshots: &[Vec<IndexSnapshot>]) -> Vec<Vec<IdRow<Partition>>> {
-        let to_multiply = snapshots
-            .iter()
-            .map(|union| {
-                union
-                    .iter()
-                    .flat_map(|index| index.partitions().iter().map(|p| p.partition().clone()))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        let mut to_multiply = Vec::new();
+        let mut multi_partitions = HashMap::<u64, Vec<_>>::new();
+        for union in snapshots.iter() {
+            let mut ordinary_partitions = Vec::new();
+            for index in union {
+                for p in &index.partitions {
+                    match p.partition.get_row().multi_partition_id() {
+                        Some(id) => multi_partitions
+                            .entry(id)
+                            .or_default()
+                            .push(p.partition.clone()),
+                        None => ordinary_partitions.push(p.partition.clone()),
+                    }
+                }
+            }
+            if !ordinary_partitions.is_empty() {
+                to_multiply.push(ordinary_partitions);
+            }
+        }
+        assert!(to_multiply.is_empty() || multi_partitions.is_empty(),
+                "invalid state during partition selection. to_multiply: {:?}, multi_partitions: {:?}, snapshots: {:?}",
+                to_multiply, multi_partitions, snapshots);
+        // Multi partitions define how we distribute joins. They may not be present, though.
+        // TODO: parent partitions have to be merged into ordinary ones.
+        if !multi_partitions.is_empty() {
+            let mut r = multi_partitions.into_values().collect_vec();
+            r.sort_unstable_by_key(|p| p[0].get_row().multi_partition_id().unwrap());
+            return r;
+        }
+        // Ordinary partitions need to be duplicated on multiple machines.
         let partitions = to_multiply
             .into_iter()
             .multi_cartesian_product()
@@ -605,9 +626,11 @@ impl ClusterSendExec {
         let mut m: HashMap<String, Vec<u64>> = HashMap::new();
         for ps in &logical {
             let ids = ps.iter().map(|p| p.get_id()).collect_vec();
-            m.entry(c.node_name_by_partitions(&ids))
-                .or_default()
-                .extend(ids)
+            let node = match ps[0].get_row().multi_partition_id() {
+                Some(multi_id) => c.node_name_by_partitions(&[multi_id]),
+                None => c.node_name_by_partitions(&ids),
+            };
+            m.entry(node).or_default().extend(ids)
         }
 
         let mut r = m.into_iter().collect_vec();

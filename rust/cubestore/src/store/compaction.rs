@@ -1,25 +1,34 @@
 use crate::config::injection::DIService;
 use crate::config::ConfigObj;
-use crate::metastore::MetaStore;
+use crate::metastore::multi_index::MultiPartition;
+use crate::metastore::{MetaStore, Partition, PartitionData};
 use crate::remotefs::RemoteFs;
-use crate::store::{ChunkDataStore, ROW_GROUP_SIZE};
+use crate::store::{ChunkDataStore, ChunkStore, ROW_GROUP_SIZE};
 use crate::table::data::cmp_partition_key;
 use crate::table::parquet::{arrow_schema, ParquetTableStore};
 use crate::table::redistribute::redistribute;
 use crate::table::{Row, TableValue};
 use crate::CubeError;
-use arrow::array::ArrayRef;
+use arrow::array::{ArrayRef, UInt64Array};
 use arrow::compute::{lexsort_to_indices, SortColumn, SortOptions};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::cube_ext;
 use datafusion::physical_plan::empty::EmptyExec;
-use datafusion::physical_plan::expressions::Column;
+use datafusion::physical_plan::expressions::{Column, Count, Literal};
+use datafusion::physical_plan::hash_aggregate::{
+    AggregateMode, AggregateStrategy, HashAggregateExec,
+};
 use datafusion::physical_plan::memory::MemoryExec;
 use datafusion::physical_plan::merge_sort::MergeSortExec;
 use datafusion::physical_plan::parquet::ParquetExec;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
+use datafusion::physical_plan::{
+    AggregateExpr, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
+};
+use datafusion::scalar::ScalarValue;
+use futures::StreamExt;
 use itertools::{EitherOrBoth, Itertools};
 use num::integer::div_ceil;
 use num::Integer;
@@ -33,6 +42,7 @@ use std::sync::{Arc, Mutex};
 #[async_trait]
 pub trait CompactionService: DIService + Send + Sync {
     async fn compact(&self, partition_id: u64) -> Result<(), CubeError>;
+    async fn split_multi_partition(&self, multi_partition_id: u64) -> Result<(), CubeError>;
 }
 
 pub struct CompactionServiceImpl {
@@ -91,14 +101,23 @@ impl CompactionService for CompactionServiceImpl {
             .map(|c| c.get_row().get_row_count())
             .sum::<u64>();
         let total_rows = partition.get_row().main_table_row_count() + chunks_row_count;
-        let new_partitions_count =
-            div_ceil(total_rows, self.config.partition_split_threshold()) as usize;
+        // TODO: handle concurrent runs with multi-partition split.
+        if partition.get_row().multi_partition_id().is_some() {
+            return Err(CubeError::internal(
+                "Refusing to run compaction on parts of a multi-partition".to_string(),
+            ));
+        }
+        let new_partitions_count = if partition.get_row().multi_partition_id().is_some() {
+            1 // multi-partitions get split with a different process.
+        } else {
+            div_ceil(total_rows, self.config.partition_split_threshold()) as usize
+        };
 
         let mut new_partitions = Vec::new();
         for _ in 0..new_partitions_count {
             new_partitions.push(
                 self.meta_store
-                    .create_partition(partition.get_row().child(partition.get_id()))
+                    .create_partition(Partition::new_child(&partition, None))
                     .await?,
             );
         }
@@ -283,6 +302,271 @@ impl CompactionService for CompactionServiceImpl {
 
         Ok(())
     }
+
+    async fn split_multi_partition(&self, multi_partition_id: u64) -> Result<(), CubeError> {
+        let (multi_index, multi_partition, partitions) = self
+            .meta_store
+            .prepare_multi_partition_for_split(multi_partition_id)
+            .await?;
+        log::trace!(
+            "Preparing to split multi-partition {}:{:?} with partitions {:?}",
+            multi_partition_id,
+            multi_partition.get_row(),
+            partitions
+        );
+        let key_len = multi_index.get_row().key_columns().len();
+
+        // Find key ranges for new partitions.
+        let files = download_files(&partitions, self.remote_fs.clone()).await?;
+        let keys = find_partition_keys(
+            keys_with_counts(&files, key_len).await?,
+            key_len,
+            self.config.partition_split_threshold() as usize,
+        )
+        .await?;
+        // There is no point if we cannot split the partition.
+        log::trace!(
+            "Split keys for multi-partition {}:{:?}",
+            multi_partition_id,
+            keys
+        );
+        if keys.len() == 0 {
+            return Ok(());
+        }
+
+        // Split multi-partition.
+        let create_child = |min, max| {
+            self.meta_store
+                .create_multi_partition(MultiPartition::new_child(&multi_partition, min, max))
+        };
+        let mut mchildren = Vec::with_capacity(1 + keys.len());
+        mchildren.push(
+            create_child(
+                multi_partition.get_row().min_row().cloned(),
+                Some(keys[0].clone()),
+            )
+            .await?,
+        );
+        for i in 0..keys.len() - 1 {
+            mchildren.push(create_child(Some(keys[i].clone()), Some(keys[i + 1].clone())).await?);
+        }
+        mchildren.push(
+            create_child(
+                Some(keys.last().unwrap().clone()),
+                multi_partition.get_row().max_row().cloned(),
+            )
+            .await?,
+        );
+
+        let mut uploads = Vec::new();
+        let mut old_chunks = Vec::new();
+        let mut old_partitions = Vec::with_capacity(partitions.len());
+        let mut new_partitions = Vec::with_capacity(mchildren.len() * partitions.len());
+        let mut new_partition_rows = Vec::with_capacity(new_partitions.capacity());
+        let mut mrow_counts = vec![0; mchildren.len()];
+        for p in &partitions {
+            let mut children = Vec::with_capacity(mchildren.len());
+            for mc in &mchildren {
+                let c = Partition::new_child(&p.partition, Some(mc.get_id()));
+                let c = c.update_min_max_and_row_count(
+                    mc.get_row().min_row().cloned(),
+                    mc.get_row().max_row().cloned(),
+                    0,
+                );
+                children.push(self.meta_store.create_partition(c).await?)
+            }
+
+            let mut in_files = Vec::new();
+            collect_remote_files(&p, &mut in_files);
+            for f in &mut in_files {
+                *f = self.remote_fs.local_file(f).await?;
+            }
+
+            let mut out_files = Vec::with_capacity(children.len());
+            let mut out_remote_paths = Vec::with_capacity(children.len());
+            for c in &children {
+                let remote_path = c.get_row().get_full_name(c.get_id()).unwrap();
+                out_files.push(self.remote_fs.temp_upload_path(&remote_path).await?);
+                out_remote_paths.push(remote_path);
+            }
+
+            let records = read_files(&in_files, key_len, None)
+                .await?
+                .execute(0)
+                .await?;
+            let store = ParquetTableStore::new(p.index.get_row().clone(), ROW_GROUP_SIZE);
+            let row_counts =
+                write_to_files_by_keys(records, store, out_files.clone(), keys.clone()).await?;
+
+            for i in 0..row_counts.len() {
+                mrow_counts[i] += row_counts[i] as u64;
+            }
+            old_partitions.push(p.partition.get_id());
+            for c in &p.chunks {
+                old_chunks.push(c.get_id());
+            }
+            for i in 0..children.len() {
+                new_partitions.push(children[i].get_id());
+                new_partition_rows.push(row_counts[i] as u64)
+            }
+            for i in 0..row_counts.len() {
+                if row_counts[i] == 0 {
+                    continue;
+                }
+                let fs = self.remote_fs.clone();
+                let local_path = take(&mut out_files[i]);
+                let remote_path = take(&mut out_remote_paths[i]);
+                uploads.push(cube_ext::spawn(async move {
+                    fs.upload_file(&local_path, &remote_path).await
+                }));
+            }
+        }
+
+        for u in uploads {
+            u.await??;
+        }
+
+        let mids = mchildren.into_iter().map(|p| p.get_id()).collect_vec();
+        self.meta_store
+            .commit_multi_partition_split(
+                multi_partition_id,
+                mids,
+                mrow_counts,
+                old_partitions,
+                old_chunks,
+                new_partitions,
+                new_partition_rows,
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+/// Compute keys that partitions must be split by.
+async fn find_partition_keys(
+    p: HashAggregateExec,
+    key_len: usize,
+    rows_per_partition: usize,
+) -> Result<Vec<Row>, CubeError> {
+    let mut s = p.execute(0).await?;
+    let mut points = Vec::new();
+    let mut row_count = 0;
+    while let Some(b) = s.next().await.transpose()? {
+        let counts = b
+            .column(key_len)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .values();
+        for i in 0..b.num_rows() {
+            let c = counts[i] as usize;
+            if rows_per_partition < row_count + c {
+                points.push(Row::new(TableValue::from_columns(
+                    &b.columns()[0..key_len],
+                    i,
+                )));
+                row_count = 0;
+            }
+            row_count += c;
+        }
+    }
+
+    Ok(points)
+}
+
+async fn read_files(
+    files: &[String],
+    key_len: usize,
+    projection: Option<Vec<usize>>,
+) -> Result<Arc<dyn ExecutionPlan>, CubeError> {
+    let mut inputs = Vec::<Arc<dyn ExecutionPlan>>::with_capacity(files.len());
+    for f in files {
+        inputs.push(Arc::new(ParquetExec::try_from_files(
+            &[f.as_str()],
+            projection.clone(),
+            None,
+            ROW_GROUP_SIZE,
+            1,
+            None,
+        )?));
+    }
+    let plan = Arc::new(UnionExec::new(inputs));
+    let fields = plan.schema();
+    let fields = fields.fields();
+    let mut columns = Vec::with_capacity(fields.len());
+    for i in 0..key_len {
+        columns.push(Column::new(fields[i].name().as_str(), i));
+    }
+    Ok(Arc::new(MergeSortExec::try_new(plan, columns.clone())?))
+}
+
+/// The returned execution plan computes all keys in sorted order and the count of rows that have
+/// this key in the input files.
+async fn keys_with_counts(
+    files: &[String],
+    key_len: usize,
+) -> Result<HashAggregateExec, CubeError> {
+    let projection = (0..key_len).collect_vec();
+    let plan = read_files(files, key_len, Some(projection.clone())).await?;
+
+    let fields = plan.schema();
+    let fields = fields.fields();
+    let mut key = Vec::<(Arc<dyn PhysicalExpr>, String)>::with_capacity(key_len);
+    for i in 0..key_len {
+        let name = fields[i].name().clone();
+        let col = Column::new(fields[i].name().as_str(), i);
+        key.push((Arc::new(col), name));
+    }
+    let agg: Vec<Arc<dyn AggregateExpr>> = vec![Arc::new(Count::new(
+        Arc::new(Literal::new(ScalarValue::Int64(Some(1)))),
+        "#mi_row_count",
+        DataType::UInt64,
+    ))];
+    let plan_schema = plan.schema();
+    let plan = HashAggregateExec::try_new(
+        AggregateStrategy::InplaceSorted,
+        Some(projection),
+        AggregateMode::Full,
+        key,
+        agg,
+        plan,
+        plan_schema,
+    )?;
+    Ok(plan)
+}
+
+fn collect_remote_files(p: &PartitionData, out: &mut Vec<String>) {
+    if p.partition.get_row().is_active() {
+        if let Some(f) = p.partition.get_row().get_full_name(p.partition.get_id()) {
+            out.push(f)
+        }
+    }
+    for c in &p.chunks {
+        out.push(ChunkStore::chunk_remote_path(c.get_id()));
+    }
+}
+
+async fn download_files(
+    ps: &[PartitionData],
+    fs: Arc<dyn RemoteFs>,
+) -> Result<Vec<String>, CubeError> {
+    let mut tasks = Vec::new();
+    let mut remote_files = Vec::new();
+    for p in ps {
+        collect_remote_files(p, &mut remote_files);
+        for f in &mut remote_files {
+            let f = take(f);
+            let fs = fs.clone();
+            tasks.push(cube_ext::spawn(async move { fs.download_file(&f).await }))
+        }
+        remote_files.clear();
+    }
+
+    let mut results = Vec::new();
+    for t in tasks {
+        results.push(t.await??)
+    }
+    Ok(results)
 }
 
 /// Writes [records] into [files], trying to split into equally-sized rows, with an additional
@@ -294,9 +578,77 @@ pub(crate) async fn write_to_files(
     store: ParquetTableStore,
     files: Vec<String>,
 ) -> Result<Vec<(usize, Vec<TableValue>)>, CubeError> {
-    let schema = Arc::new(store.arrow_schema());
-    let key_size = store.key_size() as usize;
     let rows_per_file = (num_rows as usize).div_ceil(&files.len());
+    let key_size = store.key_size() as usize;
+
+    let mut last_row = Vec::new();
+    // (num_rows, first_row) for all processed writers.
+    let stats = Arc::new(Mutex::new(vec![(0, Vec::new())]));
+    let stats_ref = stats.clone();
+
+    let pick_writer = |b: &RecordBatch| -> WriteBatchTo {
+        let stats_ref = stats_ref.clone();
+        let mut stats = stats_ref.lock().unwrap();
+
+        let (num_rows, first_row) = stats.last_mut().unwrap();
+        if first_row.is_empty() {
+            *first_row = TableValue::from_columns(&b.columns()[0..key_size], 0);
+        }
+        if *num_rows + b.num_rows() < rows_per_file {
+            *num_rows += b.num_rows();
+            return WriteBatchTo::Current;
+        }
+
+        let mut i;
+        if last_row.is_empty() {
+            i = rows_per_file - *num_rows - 1;
+            last_row = TableValue::from_columns(&b.columns()[0..key_size], i);
+            i += 1;
+        } else {
+            i = 0;
+        }
+        // Keep writing into the same file until we see a different key.
+        while i < b.num_rows()
+            && cmp_partition_key(key_size, &last_row, b.columns(), i) == Ordering::Equal
+        {
+            i += 1;
+        }
+        if i == b.num_rows() {
+            *num_rows += b.num_rows();
+            return WriteBatchTo::Current;
+        }
+
+        *num_rows += i;
+        stats.push((0, Vec::new()));
+        last_row.clear();
+        return WriteBatchTo::Next {
+            rows_for_current: i,
+        };
+    };
+
+    write_to_files_impl(records, store, files, pick_writer).await?;
+
+    let mut stats = take(stats.lock().unwrap().deref_mut());
+    if stats.last().unwrap().0 == 0 {
+        stats.pop();
+    }
+    Ok(stats)
+}
+
+enum WriteBatchTo {
+    /// Current batch must be fully written into the current file.
+    Current,
+    /// Current batch must be written (partially or fully) into the next file.
+    Next { rows_for_current: usize },
+}
+
+async fn write_to_files_impl(
+    records: SendableRecordBatchStream,
+    store: ParquetTableStore,
+    files: Vec<String>,
+    mut pick_writer: impl FnMut(&RecordBatch) -> WriteBatchTo,
+) -> Result<(), CubeError> {
+    let schema = Arc::new(store.arrow_schema());
     let mut writers = files.into_iter().map(move |f| -> Result<_, CubeError> {
         Ok(ArrowWriter::try_new(
             File::create(f)?,
@@ -325,56 +677,21 @@ pub(crate) async fn write_to_files(
         Ok(())
     });
 
-    // Stats for the current writer.
-    let mut writer_i = Ok(0); // Ok(n) marks active file, Err(n) marks finished file.
-    let mut last_row = Vec::new();
-    // (num_rows, first_row) for all processed writers.
-    let stats = Arc::new(Mutex::new(vec![(0, Vec::new())]));
-    let stats_ref = stats.clone();
+    let mut writer_i = 0;
     let mut process_row_group = move |b: RecordBatch| -> Result<_, CubeError> {
-        let stats_ref = stats_ref.clone();
-        let mut stats = stats_ref.lock().unwrap();
-        if let Err(n) = writer_i {
-            writer_i = Ok(n + 1);
-            stats.push((0, Vec::new()));
-            last_row.clear();
+        match pick_writer(&b) {
+            WriteBatchTo::Current => Ok(((writer_i, b), None)),
+            WriteBatchTo::Next {
+                rows_for_current: n,
+            } => {
+                let current_writer = writer_i;
+                writer_i += 1; // Next iteration will write into the next file.
+                Ok((
+                    (current_writer, b.slice(0, n)),
+                    Some(b.slice(n, b.num_rows() - n)),
+                ))
+            }
         }
-
-        let (num_rows, first_row) = stats.last_mut().unwrap();
-        let current_writer = writer_i.unwrap();
-
-        if first_row.is_empty() {
-            *first_row = TableValue::from_columns(&b.columns()[0..key_size], 0);
-        }
-        if *num_rows + b.num_rows() < rows_per_file {
-            *num_rows += b.num_rows();
-            return Ok(((current_writer, b), None));
-        }
-        let mut i;
-        if last_row.is_empty() {
-            i = rows_per_file - *num_rows - 1;
-            last_row = TableValue::from_columns(&b.columns()[0..key_size], i);
-            i += 1;
-        } else {
-            i = 0;
-        }
-        // Keep writing into the same file until we see a different key.
-        while i < b.num_rows()
-            && cmp_partition_key(key_size, &last_row, b.columns(), i) == Ordering::Equal
-        {
-            i += 1;
-        }
-        if i == b.num_rows() {
-            *num_rows += b.num_rows();
-            return Ok(((current_writer, b), None));
-        }
-
-        *num_rows += i;
-        writer_i = Err(current_writer); // Next iteration will write into a new file.
-        return Ok((
-            (current_writer, b.slice(0, i)),
-            Some(b.slice(i, b.num_rows() - i)),
-        ));
     };
     let err = redistribute(records, ROW_GROUP_SIZE, move |b| {
         let r = process_row_group(b);
@@ -391,8 +708,66 @@ pub(crate) async fn write_to_files(
     io_job.await??;
     err?;
 
-    let stats = take(stats.lock().unwrap().deref_mut());
-    Ok(stats)
+    Ok(())
+}
+
+async fn write_to_files_by_keys(
+    records: SendableRecordBatchStream,
+    store: ParquetTableStore,
+    files: Vec<String>,
+    keys: Vec<Row>,
+) -> Result<Vec<usize>, CubeError> {
+    assert_eq!(files.len(), 1 + keys.len());
+    let mut row_counts = Vec::with_capacity(files.len());
+    row_counts.push(0);
+    let row_counts = Arc::new(Mutex::new(row_counts));
+    let key_size = store.key_size() as usize;
+    let mut next_key = 0;
+    let row_counts_ref = row_counts.clone();
+    let pick_writer = move |b: &RecordBatch| {
+        assert_ne!(b.num_rows(), 0);
+        let mut row_counts = row_counts_ref.lock().unwrap();
+        if next_key == keys.len() {
+            *row_counts.last_mut().unwrap() += b.num_rows();
+            return WriteBatchTo::Current;
+        }
+        if cmp_partition_key(
+            key_size,
+            keys[next_key].values().as_slice(),
+            b.columns(),
+            b.num_rows() - 1,
+        ) >= Ordering::Equal
+        {
+            *row_counts.last_mut().unwrap() += b.num_rows();
+            return WriteBatchTo::Current;
+        }
+        for i in 0..b.num_rows() {
+            if cmp_partition_key(key_size, keys[next_key].values().as_slice(), b.columns(), i)
+                >= Ordering::Equal
+            {
+                *row_counts.last_mut().unwrap() += i;
+                row_counts.push(0);
+
+                next_key += 1;
+                return WriteBatchTo::Next {
+                    rows_for_current: i,
+                };
+            }
+        }
+        panic!("impossible")
+    };
+    let num_files = files.len();
+    write_to_files_impl(records, store, files, pick_writer).await?;
+
+    let mut row_counts: Vec<usize> = take(row_counts.lock().unwrap().as_mut());
+    assert!(
+        row_counts.len() <= num_files,
+        "{} <= {}",
+        row_counts.len(),
+        num_files
+    );
+    row_counts.resize(num_files, 0);
+    Ok(row_counts)
 }
 
 async fn merge_chunks(
