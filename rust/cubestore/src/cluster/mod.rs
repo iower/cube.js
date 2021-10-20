@@ -534,6 +534,11 @@ impl JobRunner {
                 self.meta_store.get_job(job_id).await?
             );
         } else if let Ok(Err(cube_err)) = res {
+            error!(
+                "Error while running job {}: {}",
+                job_id,
+                cube_err.display_with_backtrace()
+            );
             self.meta_store
                 .update_status(job_id, JobStatus::Error(cube_err.to_string()))
                 .await?;
