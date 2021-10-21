@@ -1045,7 +1045,7 @@ impl ClusterImpl {
         node_name: &str,
         m: NetworkMessage,
     ) -> Result<NetworkMessage, CubeError> {
-        if self.server_name == node_name {
+        if self.server_name == node_name || is_self_reference(node_name) {
             // TODO: query_timeout currently used for all messages.
             // TODO timeout config
             Ok(timeout(
@@ -1069,7 +1069,7 @@ impl ClusterImpl {
         m: NetworkMessage,
     ) -> Result<Box<dyn WorkerConnection>, CubeError> {
         assert!(m.is_streaming_request());
-        if self.server_name == node_name {
+        if self.server_name == node_name || is_self_reference(node_name) {
             let c: Box<dyn WorkerConnection> = Box::new(LoopbackConnection {
                 stream: ClusterImpl::start_stream_on_worker(self.clone(), m).await,
             });
@@ -1333,4 +1333,8 @@ impl MessageStream for QueryStream {
         let finished = batch.is_none();
         (NetworkMessage::SelectResultBatch(Ok(batch)), finished)
     }
+}
+
+fn is_self_reference(name: &str) -> bool {
+    name.starts_with("@loop:")
 }
