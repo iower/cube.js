@@ -1,6 +1,7 @@
 use crate::config::injection::DIService;
 use crate::config::ConfigObj;
 use crate::metastore::multi_index::MultiPartition;
+use crate::metastore::partition::partition_file_name;
 use crate::metastore::{MetaStore, Partition, PartitionData};
 use crate::remotefs::RemoteFs;
 use crate::store::{ChunkDataStore, ChunkStore, ROW_GROUP_SIZE};
@@ -141,7 +142,7 @@ impl CompactionService for CompactionServiceImpl {
 
         let mut new_partition_local_files = Vec::new();
         for p in new_partitions.iter() {
-            let new_remote_path = p.get_row().get_full_name(p.get_id()).unwrap();
+            let new_remote_path = partition_file_name(p.get_id());
             new_partition_local_files.push(self.remote_fs.temp_upload_path(&new_remote_path).await?)
         }
 
@@ -208,7 +209,7 @@ impl CompactionService for CompactionServiceImpl {
         {
             match p {
                 EitherOrBoth::Both(p, _) => {
-                    let new_remote_path = p.get_row().get_full_name(p.get_id()).unwrap();
+                    let new_remote_path = partition_file_name(p.get_id());
                     self.remote_fs
                         .upload_file(&new_partition_local_files[i], new_remote_path.as_str())
                         .await?;
@@ -385,7 +386,7 @@ impl CompactionService for CompactionServiceImpl {
             let mut out_files = Vec::with_capacity(children.len());
             let mut out_remote_paths = Vec::with_capacity(children.len());
             for c in &children {
-                let remote_path = c.get_row().get_full_name(c.get_id()).unwrap();
+                let remote_path = partition_file_name(c.get_id());
                 out_files.push(self.remote_fs.temp_upload_path(&remote_path).await?);
                 out_remote_paths.push(remote_path);
             }
